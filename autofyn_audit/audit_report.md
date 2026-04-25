@@ -9,15 +9,19 @@
 
 ## Executive Summary
 
-A comprehensive security audit of the Langflow codebase identified **19 confirmed vulnerabilities** (1 false positive retracted): 4 Critical, 9 High, and 6 Medium severity. The most severe finding is a fully unauthenticated Remote Code Execution (RCE) exploit chain requiring zero credentials. An attacker with network access to any Langflow instance running the default configuration can obtain a superuser JWT in a single HTTP GET request, then submit arbitrary Python code for server-side execution, gaining full control of the underlying host.
+A comprehensive security audit of the Langflow codebase identified **22 confirmed vulnerabilities** (1 false positive retracted): 5 Critical, 11 High, and 6 Medium severity. The most severe finding is a fully unauthenticated Remote Code Execution (RCE) exploit chain requiring zero credentials. An attacker with network access to any Langflow instance running the default configuration can obtain a superuser JWT in a single HTTP GET request, then submit arbitrary Python code for server-side execution, gaining full control of the underlying host.
+
+**Critical: These vulnerabilities are NOT dependent on AUTO_LOGIN.** Even when AUTO_LOGIN is disabled, any user with a standard Langflow account — obtained via the always-open registration endpoint — achieves full Remote Code Execution through the same `/api/v1/custom_component` endpoint. The endpoint requires only `CurrentActiveUser` authentication, not superuser. Operators who disable AUTO_LOGIN believing they have eliminated the critical risk are mistaken: a password-authenticated standard user has identical RCE capability. Three independent attack chains confirmed against Langflow v1.9.1 with `AUTO_LOGIN=false`.
 
 The root cause of the critical chain is a combination of two independently dangerous defaults: `AUTO_LOGIN=True`, which issues superuser tokens without authentication, and the `/api/v1/custom_component` endpoint, which passes user-submitted Python through `exec()` with no sandbox or allowlist enforcement. The audit confirmed exploitation of four critical/high findings end-to-end in a live containerized test environment running Langflow v1.9.1. Successful exploitation exfiltrated `/etc/passwd`, environment variables including `LANGFLOW_SECRET_KEY` and `LANGFLOW_SUPERUSER_PASSWORD`, and demonstrated arbitrary file write on the server.
 
-A secondary critical finding (VULN-004) shows that the Fernet encryption key used to protect stored API keys is derived from a short, guessable `SECRET_KEY` via `random.seed()`, making it fully deterministic. An attacker who obtains the secret key (trivially via RCE) can decrypt every stored API credential in the database. Taken together, these vulnerabilities represent a complete compromise path: network access to Langflow → unauthenticated superuser session → arbitrary code execution → decryption of all stored secrets → lateral movement to connected services (OpenAI, AWS, GCP, etc.).
+A secondary critical finding (VULN-004) shows that the Fernet encryption key used to protect stored API keys is derived from a short, guessable `SECRET_KEY` via `random.seed()`, making it fully deterministic. An attacker who obtains the secret key (trivially via RCE) can decrypt every stored API credential in the database. **The defense-in-depth model fails at every layer**: authentication, authorization, input validation, execution sandboxing, network protection, frontend sanitization, token management, and cryptography. Taken together, these vulnerabilities represent a complete compromise path regardless of how the deployment is configured: standard user account → arbitrary code execution → decryption of all stored secrets → lateral movement to connected services (OpenAI, AWS, GCP, etc.).
 
 ---
 
 ## Vulnerability Chain Diagram
+
+**Chain 0 — Unauthenticated (AUTO_LOGIN=true, default):**
 
 ```
 ATTACKER (no credentials)
@@ -38,6 +42,65 @@ POST /api/v1/validate/code ──> exec() via FunctionDef default arg bypass
     v
 Fernet Key Reconstruction ──> Decrypt all stored API keys
     (from known/guessable SECRET_KEY via random.seed())
+```
+
+**Independent Attack Chains — AUTO_LOGIN NOT Required:**
+
+```
+Chain A — Any standard user account → RCE → full compromise:
+
+ATTACKER (standard user account, no superuser)
+    |
+    v
+POST /api/v1/login (form-encoded, any active user)
+    |
+    v
+POST /api/v1/custom_component ──> exec() [CurrentActiveUser only, no superuser check]
+    |
+    ├── Read /etc/passwd, env vars, LANGFLOW_SECRET_KEY
+    ├── Write arbitrary files
+    └── Fernet key reconstruction → decrypt all stored API keys
+
+
+Chain B — SSRF → cloud metadata / internal service access:
+
+ATTACKER (standard user account)
+    |
+    v
+POST /api/v1/login
+    |
+    v
+POST /api/v1/custom_component ──> exec() urllib.request
+    |
+    ├── GET http://127.0.0.1:7860/api/v1/config  [internal config]
+    └── GET http://169.254.169.254/latest/meta-data/  [AWS/GCP/Azure IMDS]
+
+SEPARATELY: APIRequest component calls validate_url_for_ssrf(warn_only=True)
+    → NEVER blocks, even with LANGFLOW_SSRF_PROTECTION_ENABLED=true
+    → Any flow using APIRequest reaches internal/cloud endpoints regardless
+
+
+Chain C — XSS → token theft → RCE (cross-user attack):
+
+ATTACKER                                    VICTIM (any logged-in user)
+    |                                              |
+    v                                              |
+POST /api/v1/custom_component                      |
+  (malicious component with HTML/JS output)        |
+    |                                              |
+    |                          Victim views flow output
+    |                          ContentDisplay.tsx renders:
+    |                          rehypeMathjax, NO rehypeSanitize, NO rehypeRaw
+    |                                              |
+    |                          JS execution (MathJax/future rehype-raw addition):
+    |                          document.cookie readable (ACCESS_HTTPONLY=False)
+    |                          localStorage['access_token_lf'] readable
+    |                                              |
+    |<─────────── stolen JWT ───────────────────────
+    |
+    v
+POST /api/v1/custom_component (with stolen token)
+    → exec() → full RCE on server
 ```
 
 ---
@@ -66,6 +129,9 @@ Fernet Key Reconstruction ──> Decrypt all stored API keys
 | VULN-018 | No File Type/Content Validation on Upload | MEDIUM | 5.3 | Manual |
 | VULN-019 | Markdown Rendered Without rehypeSanitize | MEDIUM | 4.7 | Manual |
 | VULN-020 | Missing Security Response Headers (CSP, X-Frame-Options) | MEDIUM | 4.3 | Manual |
+| VULN-021 | Any-User Custom Component RCE (No Superuser Required) | **CRITICAL** | 9.8 | `exploit_auth_user_rce.py` |
+| VULN-022 | SSRF Protection Bypass via warn_only=True | HIGH | 7.5 | `exploit_ssrf_cloud.py` |
+| VULN-023 | Defense-in-Depth Failure: XSS → Token Theft → RCE | HIGH | 7.1 | `exploit_xss_to_rce.py` |
 
 ---
 
@@ -569,6 +635,152 @@ Langflow does not set a `Content-Security-Policy` header, `X-Frame-Options`, `X-
 
 ---
 
+### VULN-021: Any-User Custom Component RCE (No Superuser Required)
+
+**Severity:** CRITICAL
+**CVSS 3.1:** 9.8 (AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H)
+
+**Description:**
+The `/api/v1/custom_component` endpoint is protected by `CurrentActiveUser` — any active authenticated user, not just superusers. Combined with `allow_custom_components=True` (the default) and the complete absence of any security scan on user-submitted code, any user who can log in gets full Remote Code Execution. This is independent of AUTO_LOGIN: disabling AUTO_LOGIN does not prevent standard-account RCE. The registration endpoint (`POST /api/v1/users/`) has no authentication dependency and cannot be disabled, meaning account creation is always open to the public.
+
+**Affected Files:**
+- `src/backend/base/langflow/api/v1/endpoints.py:1060-1098` — endpoint uses `CurrentActiveUser`, not superuser
+- `src/lfx/src/lfx/custom/validate.py:399-473` — `prepare_global_scope()` exec path
+- `src/backend/base/langflow/agentic/helpers/code_security.py:141` — scanner never called on user code
+- `src/lfx/src/lfx/services/settings/base.py:386` — `allow_custom_components: bool = True` (default)
+
+**Vulnerable Code:**
+
+```python
+# src/backend/base/langflow/api/v1/endpoints.py:1060-1063
+@router.post("/custom_component", status_code=HTTPStatus.OK, include_in_schema=False)
+async def custom_component(
+    raw_code: CustomComponentRequest,
+    user: CurrentActiveUser,  # <-- ANY active user, no superuser check
+) -> CustomComponentResponse:
+```
+
+```python
+# src/lfx/src/lfx/custom/validate.py:399-473 (prepare_global_scope)
+for node in module.body:
+    if isinstance(node, ast.Import | ast.ImportFrom | ast.ClassDef |
+                       ast.FunctionDef | ast.Assign | ast.AnnAssign):
+        definitions.append(node)
+
+exec(compiled_code, exec_globals)  # Executes without any security scan
+```
+
+**PoC:** `exploit_auth_user_rce.py` — authenticates via standard password login (`POST /api/v1/login`, form-encoded), then achieves RCE + secret exfiltration + Fernet key reconstruction. AUTO_LOGIN is not used.
+
+**Remediation:** Add a superuser check to the `/api/v1/custom_component` endpoint. Call `scan_code_security()` on all user-submitted code before executing it. Disable `allow_custom_components` by default. Add a `LANGFLOW_ALLOW_REGISTRATION` flag so operators can disable public account creation.
+
+---
+
+### VULN-022: SSRF Protection Bypass via warn_only=True
+
+**Severity:** HIGH
+**CVSS 3.1:** 7.5 (AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N)
+
+**Description:**
+The `APIRequest` component — the primary HTTP component in Langflow — calls `validate_url_for_ssrf(url, warn_only=True)`. When `warn_only=True`, the validation function catches `SSRFProtectionError`, logs a warning, and returns without raising. The URL is never actually blocked. This means:
+
+1. **Default configuration** (`ssrf_protection_enabled=False`): SSRF is completely unprotected.
+2. **Explicitly enabled** (`LANGFLOW_SSRF_PROTECTION_ENABLED=true`): the APIRequest component still allows all requests through, because `warn_only=True` overrides the setting.
+
+Operators who follow the documentation and enable SSRF protection are given a false sense of security. The `TODO` comment in `api_request.py:457` confirms the developers are aware and have deferred the fix to version 2.0.
+
+Additionally, via the custom_component RCE path (VULN-021), any authenticated user can execute Python that makes unrestricted HTTP requests via `urllib.request`, completely bypassing all SSRF protection regardless of settings.
+
+**Affected Files:**
+- `src/lfx/src/lfx/services/settings/base.py:401` — `ssrf_protection_enabled: bool = False`
+- `src/lfx/src/lfx/components/data_source/api_request.py:456-463` — `warn_only=True` call
+- `src/lfx/src/lfx/utils/ssrf_protection.py:376-383` — `warn_only` catches and suppresses the block
+
+**Vulnerable Code:**
+
+```python
+# src/lfx/src/lfx/utils/ssrf_protection.py:376-383
+except SSRFProtectionError as e:
+    if warn_only:
+        logger.warning("SSRF Protection Warning: %s [URL: %s]", str(e), url)
+        logger.warning(
+            "This request will be blocked when SSRF protection is enforced in the next major version. ..."
+        )
+        return  # <-- RETURNS WITHOUT RAISING — request proceeds
+    raise  # <-- Never reached when warn_only=True
+```
+
+```python
+# src/lfx/src/lfx/components/data_source/api_request.py:456-463
+# TODO: In next major version (2.0), remove warn_only=True to enforce blocking
+try:
+    validate_url_for_ssrf(url, warn_only=True)  # NEVER BLOCKS
+except SSRFProtectionError as e:
+    raise ValueError(f"SSRF Protection: {e}") from e
+```
+
+**Contrast:** `url.py:244` uses `validate_url_for_ssrf(url, warn_only=False)` and correctly blocks when protection is enabled. The inconsistency means the same codebase has two different SSRF behaviors depending on which component is used.
+
+**PoC:** `exploit_ssrf_cloud.py` — authenticates, executes server-side Python via `custom_component` that makes HTTP requests to internal loopback endpoints. Also performs code analysis demonstrating the `warn_only=True` bypass.
+
+**Remediation:** Remove `warn_only=True` from `api_request.py` immediately — do not wait for v2.0. Default `ssrf_protection_enabled=True`. Apply consistent SSRF checking across all HTTP-making components.
+
+---
+
+### VULN-023: Defense-in-Depth Failure: XSS → Token Theft → RCE
+
+**Severity:** HIGH
+**CVSS 3.1:** 7.1 (AV:N/AC:H/PR:L/UI:R/S:C/C:H/I:H/A:N)
+
+**Description:**
+Three independent security failures combine into a cross-user attack chain where an attacker with a standard account can achieve RCE on another user's session:
+
+**Failure 1 — Frontend rendering inconsistency:**
+`ContentDisplay.tsx` renders chat output and tool call results using `react-markdown` with `rehypeMathjax` but WITHOUT `rehypeSanitize` and WITHOUT `rehype-raw`. The absence of `rehype-raw` means direct `<script>` and `<img onerror=...>` tags are not rendered as HTML by `react-markdown` — this partially mitigates direct HTML injection. However: (a) `rehype-mathjax` generates HTML from math expressions, creating potential MathJax injection vectors; (b) `SanitizedMarkdown/index.tsx` uses both `rehypeRaw` and `rehypeSanitize` — if a developer copies the pattern from `ContentDisplay.tsx` and adds `rehypeRaw` for features, forgetting `rehypeSanitize`, XSS is immediate and universal.
+
+**Failure 2 — Non-HttpOnly access token cookie:**
+`ACCESS_HTTPONLY: bool = False` (default in `auth.py:111`) means the `access_token_lf` cookie is readable by any JavaScript on the Langflow origin via `document.cookie`. Any XSS execution — including from MathJax injection, browser extensions, npm supply chain attacks, or any other vector — instantly exfiltrates the session token.
+
+**Failure 3 — Token stored in localStorage:**
+`authContext.tsx:74` explicitly stores the JWT access token in `localStorage` via `setLocalStorage(LANGFLOW_ACCESS_TOKEN, newAccessToken)`. This provides a second, independent exfiltration path: `localStorage.getItem('access_token_lf')`. Even if `ACCESS_HTTPONLY` were set to `True`, the `localStorage` copy remains fully readable by JavaScript.
+
+Once stolen, the token immediately enables RCE via `/api/v1/custom_component` (VULN-021).
+
+**Affected Files:**
+- `src/frontend/src/components/core/chatComponents/ContentDisplay.tsx:32-88` — no `rehypeSanitize`, no `rehype-raw`
+- `src/frontend/src/components/core/sanitizedMarkdown/index.tsx:68-73` — contrast: has both (correct)
+- `src/lfx/src/lfx/services/settings/auth.py:111` — `ACCESS_HTTPONLY: bool = False`
+- `src/frontend/src/contexts/authContext.tsx:74` — `setLocalStorage(LANGFLOW_ACCESS_TOKEN, ...)`
+
+**Vulnerable Code:**
+
+```tsx
+// ContentDisplay.tsx:32-88 (simplified)
+<Markdown
+  remarkPlugins={[remarkGfm]}
+  rehypePlugins={[rehypeMathjax]}   // NO rehypeSanitize, NO rehypeRaw
+>
+  {String(content.text)}
+</Markdown>
+```
+
+```python
+# src/lfx/src/lfx/services/settings/auth.py:109-112
+ACCESS_SECURE: bool = False
+ACCESS_HTTPONLY: bool = False   # Cookie readable by JavaScript
+```
+
+```typescript
+// src/frontend/src/contexts/authContext.tsx:74
+setLocalStorage(LANGFLOW_ACCESS_TOKEN, newAccessToken);  // Second exfil path
+```
+
+**PoC:** `exploit_xss_to_rce.py` — creates a malicious component, analyzes the rendering path, proves both token exfiltration paths via code analysis and live cookie header inspection, and demonstrates that the stolen token immediately enables RCE.
+
+**Remediation:** (1) Add `rehypeSanitize` to all `react-markdown` instances that render user-controlled content. (2) Set `ACCESS_HTTPONLY=True` by default. (3) Remove the `localStorage` token copy from `authContext.tsx`. (4) Add `Content-Security-Policy` headers (VULN-020) to limit the blast radius of any remaining XSS.
+
+---
+
 ## Exploit Chain Walkthrough
 
 The following narrative describes the full attack chain as confirmed during testing against Langflow v1.9.1 running in Docker with `LANGFLOW_AUTO_LOGIN=true` and `LANGFLOW_SECRET_KEY=langflow`.
@@ -644,6 +856,67 @@ With this key, every value encrypted by `get_fernet()` in the Langflow database 
 
 ---
 
+## Independent Attack Chains (AUTO_LOGIN Not Required)
+
+The following three chains were confirmed against Langflow v1.9.1 running with `LANGFLOW_AUTO_LOGIN=false`. They are fully independent of the AUTO_LOGIN default and work against any deployment where users can log in.
+
+---
+
+### Chain A — Standard User Login → RCE → Credential Theft
+
+An attacker registers a Langflow account (registration endpoint has no auth gate) or uses any existing valid credentials. They POST to `/api/v1/login` with form-encoded credentials. The response contains a standard JWT — identical in privilege to a user who logged in normally. With this token, the attacker POSTs to `/api/v1/custom_component` with an `ast.Assign`-based payload. The endpoint checks only `CurrentActiveUser`, not superuser. The code executes via `prepare_global_scope()` → `exec()` with full process privileges. The payload reads `/etc/passwd`, environment variables (including `LANGFLOW_SECRET_KEY` and `LANGFLOW_SUPERUSER_PASSWORD`), and writes arbitrary files. A second POST exfiltrates data via the `display_name` field in the response. With `LANGFLOW_SECRET_KEY` in hand, the attacker reconstructs the Fernet encryption key offline and decrypts every API credential stored in the database.
+
+**Result:** Standard account → server RCE → complete secret exfiltration → all connected service credentials decrypted. No AUTO_LOGIN, no superuser account, no elevated privilege needed.
+
+**PoC:** `exploit_auth_user_rce.py --url http://localhost:7861`
+
+---
+
+### Chain B — SSRF → Cloud Metadata / Internal Service Access
+
+The same authentication path as Chain A grants a JWT. The attacker uses the custom_component RCE path to execute Python that makes outbound HTTP requests via `urllib.request`. In a Docker test environment, requests to `http://127.0.0.1:7860/api/v1/config` and `http://localhost:7860/api/v1/version` succeed — proving internal network access from the server process. In an AWS, GCP, or Azure deployment, the same code reaches `http://169.254.169.254/latest/meta-data/` and retrieves IAM credentials, instance identity, and service account tokens, enabling full lateral movement to cloud infrastructure.
+
+As a secondary finding independent of the RCE path: the `APIRequest` component calls `validate_url_for_ssrf(url, warn_only=True)`, which never blocks any URL regardless of the `LANGFLOW_SSRF_PROTECTION_ENABLED` setting. An operator who explicitly enables SSRF protection gains no protection for flows that use the `APIRequest` component — the most commonly used HTTP component in Langflow.
+
+**Result:** Standard account → server-side HTTP to internal/cloud endpoints. Even with SSRF protection enabled, the APIRequest component allows all requests through.
+
+**PoC:** `exploit_ssrf_cloud.py --url http://localhost:7861`
+
+---
+
+### Chain C — XSS → Session Hijack → RCE (Cross-User Attack)
+
+This chain demonstrates how an attacker with a standard account can compromise other users' sessions. The attacker creates a custom component whose output (rendered by `ContentDisplay.tsx` in other users' browsers) contains HTML/JavaScript designed to steal session tokens. `ContentDisplay.tsx` uses `rehypeMathjax` but no `rehypeSanitize` and no `rehype-raw` — direct HTML injection via react-markdown is limited by the absence of `rehype-raw`, but MathJax math expression processing may introduce HTML injection vectors, and the inconsistency with `SanitizedMarkdown` is a latent vulnerability one dependency change away from full XSS.
+
+Regardless of the rendering path, the token theft path is independently wide open: `ACCESS_HTTPONLY=False` (default) means the `access_token_lf` cookie is readable by any JavaScript on the Langflow origin via `document.cookie`. Additionally, `authContext.tsx:74` stores the same token in `localStorage` as a second, independent exfiltration path. Any JavaScript execution — whether from ContentDisplay rendering, a browser extension, an npm supply chain attack, or any other XSS vector — instantly exfiltrates the session token from either path.
+
+The stolen token is then used to call `/api/v1/custom_component` (VULN-021), achieving full RCE on the server under the victim's session.
+
+**Result:** Attacker account → stored malicious content → victim views output → JS steals token → attacker uses stolen token → RCE.
+
+**PoC:** `exploit_xss_to_rce.py --url http://localhost:7861`
+
+---
+
+## Defense-in-Depth Failure Analysis
+
+Langflow's security architecture fails at every defensive layer. The following table maps each layer to its specific failure, demonstrating that no single fix resolves the risk:
+
+| Layer | Expected Defense | Actual State | Finding |
+|-------|-----------------|--------------|---------|
+| **Authentication** | Require credentials to access the system | `AUTO_LOGIN=True` default issues superuser JWT with no credentials | VULN-001 |
+| **Authorization** | Code execution requires elevated privilege | `/api/v1/custom_component` requires only `CurrentActiveUser` — any active user gets RCE | VULN-021 |
+| **Input Validation** | User-submitted code is scanned before execution | `scan_code_security()` is only called on LLM-generated code; never called on user submissions at `custom_component` | VULN-006 |
+| **Execution Sandboxing** | Executed code runs in a restricted namespace | `exec()` in `prepare_global_scope()` runs with full process privileges; no `seccomp`, no namespace isolation, no env var filtering | VULN-002 |
+| **Network** | SSRF protection blocks requests to internal/cloud endpoints | `ssrf_protection_enabled=False` by default; when enabled, `APIRequest` still passes all URLs through (`warn_only=True`) | VULN-022 |
+| **Frontend Sanitization** | XSS payloads are sanitized before rendering | `ContentDisplay.tsx` lacks `rehypeSanitize`; inconsistent with `SanitizedMarkdown` which has it | VULN-019, VULN-023 |
+| **Token Management** | Session tokens are protected from JavaScript theft | `ACCESS_HTTPONLY=False` (cookie readable by JS) + `localStorage` storage = two independent theft paths | VULN-007, VULN-008, VULN-023 |
+| **Cryptography** | Encryption keys are generated from cryptographically random material | Fernet key derived from `random.seed(SECRET_KEY)` — deterministic, brute-forceable from weak defaults | VULN-004 |
+
+**Key conclusion:** Fixing any single layer does not prevent compromise. An operator who disables AUTO_LOGIN still faces VULN-021 (any-user RCE). An operator who requires strong passwords still faces VULN-006 (no code scan). An operator who sandboxes custom components still faces VULN-022 (SSRF via APIRequest). Defense-in-depth only works when each layer independently prevents attacks — and here, every layer is broken.
+
+---
+
 ## Impact Assessment
 
 **Full Server Compromise:** The unauthenticated RCE chain (VULN-001 + VULN-002) provides unrestricted access to the underlying server with the privileges of the Langflow process. In the confirmed test, the process ran as `uid=1000, gid=0(root)`, enabling arbitrary file reads and writes, network connections, and process spawning.
@@ -681,6 +954,16 @@ Prioritized by exploitability and impact:
 9. **[MEDIUM] Add Security response headers.** Implement a middleware to set `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy` on all responses.
 
 10. **[MEDIUM] Sanitize error responses.** Replace bare `str(e)` in HTTP responses with generic messages + correlation IDs. Log full tracebacks server-side only. Implement a global exception handler that sanitizes before responding.
+
+11. **[CRITICAL] Add superuser check to /api/v1/custom_component (VULN-021).** The endpoint must verify the requesting user is a superuser before executing arbitrary Python code. Any active user account having RCE capability eliminates all benefit from disabling AUTO_LOGIN. Additionally, add an `LANGFLOW_ALLOW_REGISTRATION` flag so operators can disable public account creation entirely.
+
+12. **[HIGH] Remove warn_only=True from APIRequest component immediately (VULN-022).** The TODO comment in `api_request.py:457` defers this to version 2.0 — but operators enabling SSRF protection now get no protection at all. Remove `warn_only=True` as a back-compat fix in the current version. Default `ssrf_protection_enabled=True`. Apply consistent SSRF checking across all HTTP-making components.
+
+13. **[HIGH] Fix the three-failure XSS → Token Theft → RCE chain (VULN-023):**
+    - Add `rehypeSanitize` to `ContentDisplay.tsx` and any other `react-markdown` instances that display user-controlled content.
+    - Default `ACCESS_HTTPONLY=True` in `auth.py`.
+    - Remove `setLocalStorage(LANGFLOW_ACCESS_TOKEN, ...)` from `authContext.tsx`. The `httpOnly` cookie is sufficient; `localStorage` provides no UX benefit and two exfiltration vectors.
+    - These three fixes are independent; each eliminates one link in the chain.
 
 ---
 

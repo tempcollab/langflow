@@ -25,27 +25,28 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 echo "Pulling langflowai/langflow:latest..."
 docker pull langflowai/langflow:latest
 
-echo "Starting container 1 (AUTO_LOGIN=true)..."
+echo "Starting container 1 (AUTO_LOGIN=true, default SECRET_KEY)..."
+echo "  NOTE: No LANGFLOW_SECRET_KEY set — Langflow will auto-generate a"
+echo "  43-char key at ~/.langflow/secret_key (realistic default config)."
+echo "  The exploit must exfiltrate this key via RCE, not reconstruct it offline."
 docker run -d \
     --name "$CONTAINER_NAME" \
     -p "$PORT:7860" \
     -e LANGFLOW_AUTO_LOGIN=true \
     -e LANGFLOW_SUPERUSER=langflow \
     -e LANGFLOW_SUPERUSER_PASSWORD=langflow \
-    -e LANGFLOW_SECRET_KEY=langflow \
     langflowai/langflow:latest
 
 # ── Container 2: AUTO_LOGIN disabled (auth-independent chains) ─────────────────
 docker rm -f "$CONTAINER_NAME_NOAUTO" 2>/dev/null || true
 
-echo "Starting container 2 (AUTO_LOGIN=false)..."
+echo "Starting container 2 (AUTO_LOGIN=false, default SECRET_KEY)..."
 docker run -d \
     --name "$CONTAINER_NAME_NOAUTO" \
     -p "$PORT2:7860" \
     -e LANGFLOW_AUTO_LOGIN=false \
     -e LANGFLOW_SUPERUSER=langflow \
     -e LANGFLOW_SUPERUSER_PASSWORD=langflow \
-    -e LANGFLOW_SECRET_KEY=langflow \
     langflowai/langflow:latest
 
 # ── Wait for container 1 ───────────────────────────────────────────────────────
@@ -93,6 +94,68 @@ if [ $ELAPSED -ge $MAX_WAIT ]; then
     echo "Check logs: docker logs $CONTAINER_NAME_NOAUTO"
     exit 1
 fi
+
+# ── Seed dummy credentials and users ──────────────────────────────────────────
+echo ""
+echo "=== Seeding test data ==="
+echo ""
+
+# Container 1: get token via auto_login, seed dummy API keys
+echo "Seeding container 1 with dummy credentials..."
+TOKEN1=$(curl -s "http://localhost:$PORT/api/v1/auto_login" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+
+if [ -n "$TOKEN1" ]; then
+    # Create dummy credentials that the exploit should find and decrypt.
+    # Use non-provider names to avoid API key validation against external services.
+    # Use "Credential" type so values are Fernet-encrypted in the DB.
+    SEED_VARS='
+        MY_OPENAI_KEY|sk-proj-FAKE-openai-key-4f8a2b1c9d3e
+        MY_ANTHROPIC_KEY|sk-ant-FAKE-anthropic-key-7x9m2k4p
+        MY_AWS_SECRET|wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    '
+    for entry in $SEED_VARS; do
+        var_name="${entry%%|*}"
+        var_value="${entry##*|}"
+        HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST "http://localhost:$PORT/api/v1/variables/" \
+            -H "Authorization: Bearer $TOKEN1" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$var_name\", \"value\": \"$var_value\", \"type\": \"Credential\", \"default_fields\": []}")
+        echo "  Container 1: $var_name -> HTTP $HTTP_CODE"
+    done
+else
+    echo "  WARNING: Could not get token for container 1. Skipping seed."
+fi
+
+# Container 2: login with superuser, seed dummy API keys
+echo "Seeding container 2 with dummy credentials..."
+TOKEN2=$(curl -s -X POST "http://localhost:$PORT2/api/v1/login" \
+    -d "username=langflow&password=langflow" \
+    -H "Content-Type: application/x-www-form-urlencoded" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+
+if [ -n "$TOKEN2" ]; then
+    SEED_VARS2='
+        MY_GITHUB_TOKEN|ghp_FAKE1234567890abcdefghijklmnopqrstuv
+        MY_SLACK_TOKEN|xoxb-FAKE-slack-bot-token-0987654321
+    '
+    for entry in $SEED_VARS2; do
+        var_name="${entry%%|*}"
+        var_value="${entry##*|}"
+        HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST "http://localhost:$PORT2/api/v1/variables/" \
+            -H "Authorization: Bearer $TOKEN2" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$var_name\", \"value\": \"$var_value\", \"type\": \"Credential\", \"default_fields\": []}")
+        echo "  Container 2: $var_name -> HTTP $HTTP_CODE"
+    done
+else
+    echo "  WARNING: Could not get token for container 2. Skipping seed."
+fi
+
+echo ""
+echo "Seed complete. Dummy credentials stored (Fernet-encrypted) in each DB."
+echo "The exploit should find, exfiltrate, and decrypt these values."
 
 # ── Usage instructions ─────────────────────────────────────────────────────────
 echo ""
